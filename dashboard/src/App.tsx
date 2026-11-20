@@ -122,11 +122,11 @@ export default function App() {
           <div className="grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(360px,420px)]">
             <div className="flex min-w-0 flex-col gap-4">
               {data ? <GainSummary data={data} /> : <SummarySkeleton />}
-              {data && data.lineup.length > 0 && data.lineup.length < 4 && (
+              {data && data.notices.length > 0 && (
                 <Notice
                   tone="warn"
-                  title="Alineación incompleta"
-                  body={`Solo ${data.lineup.length} jugadores cumplen el mínimo de ${MIN_SNAPS} snaps en esta situación.`}
+                  title={data.completed ? 'Frente completado con muestra menor' : 'Aviso del modelo'}
+                  body={data.notices.join(' ')}
                 />
               )}
               {data && data.lineup.length === 0 ? (
@@ -140,7 +140,7 @@ export default function App() {
 
             <aside className="min-w-0">
               {data && selected ? (
-                <PlayerPanel player={selected} alternatives={data.alternatives ?? []} />
+                <PlayerPanel player={selected} minSnaps={data.min_snaps} />
               ) : !data ? (
                 <PanelSkeleton />
               ) : null}

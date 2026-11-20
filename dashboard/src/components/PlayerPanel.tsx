@@ -1,51 +1,60 @@
 import { Bar, BarChart, CartesianGrid, Cell, LabelList, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { MIN_SNAPS, SLOT_LAYOUT, TIER_COLOR, TIER_LABEL, pct, rateTier, type Tier } from '../constants'
-import type { AlternativeCell, LineupPlayer, PositionRate } from '../types'
+import { SLOT_LAYOUT, TIER_COLOR, TIER_LABEL, pct, rateTier, type Tier } from '../constants'
+import type { LineupPlayer } from '../types'
 
 interface Props {
   player: LineupPlayer
-  alternatives: AlternativeCell[]
+  minSnaps: number
 }
+
+type Kind = 'assigned' | 'eligible' | 'low'
 
 interface Row {
   position: string
   rate: number // en %
   snaps: number
-  assigned: boolean
+  kind: Kind
   tier: Tier
   label: string
+  sitRate: number | null
+  sitSnaps: number
 }
 
-function buildRows(player: LineupPlayer, alternatives: AlternativeCell[]): Row[] {
-  const source: PositionRate[] =
-    player.position_rates && player.position_rates.length > 0
-      ? player.position_rates
-      : alternatives.filter((a) => a.nflId === player.nflId)
+const LOW_SAMPLE = TIER_COLOR.na
 
-  const byPos = new Map<string, PositionRate>()
-  for (const r of source) byPos.set(r.position, r)
-  // La posición asignada siempre aparece, con las métricas del contexto actual.
-  byPos.set(player.position, { position: player.position, pressure_rate: player.pressure_rate, snaps: player.snaps })
-
-  return [...byPos.values()]
-    .map((r) => ({
+/** Todas las posiciones que devuelve el backend (by_position, temporada completa), en su orden (más snaps primero). */
+function buildRows(player: LineupPlayer): Row[] {
+  const rows: Row[] = player.by_position.map((r) => {
+    const assigned = r.is_assigned || r.position === player.position
+    return {
       position: r.position,
       rate: +(r.pressure_rate * 100).toFixed(1),
       snaps: r.snaps,
-      assigned: r.position === player.position,
-      tier: rateTier(r.pressure_rate, r.snaps),
+      kind: assigned ? 'assigned' : r.eligible ? 'eligible' : 'low',
+      tier: rateTier(r.pressure_rate, r.eligible),
       label: `${(r.pressure_rate * 100).toFixed(1)}%`,
-    }))
-    .sort((a, b) => b.rate - a.rate)
+      sitRate: r.situation_pressure_rate,
+      sitSnaps: r.situation_snaps,
+    }
+  })
+  if (!rows.some((r) => r.kind === 'assigned')) {
+    rows.unshift({
+      position: player.position,
+      rate: +(player.pressure_rate * 100).toFixed(1),
+      snaps: player.snaps,
+      kind: 'assigned',
+      tier: rateTier(player.pressure_rate, player.eligible),
+      label: `${(player.pressure_rate * 100).toFixed(1)}%`,
+      sitRate: player.pressure_rate,
+      sitSnaps: player.snaps,
+    })
+  }
+  return rows
 }
 
-function fallbackExplanation(player: LineupPlayer, rows: Row[]): string {
-  const others = rows.filter((r) => !r.assigned && r.snaps >= MIN_SNAPS)
-  if (others.length === 0) {
-    return `Solo tiene muestra suficiente (≥${MIN_SNAPS} snaps) como ${player.position}: ${pct(player.pressure_rate)} en ${player.snaps} snaps.`
-  }
-  const best = others[0]
-  return `Genera ${pct(player.pressure_rate)} de presión alineado como ${player.position} (${player.snaps} snaps) frente a ${best.rate.toFixed(1)}% como ${best.position} (${best.snaps} snaps).`
+function barFill(r: Row): string {
+  if (r.tier === 'na') return LOW_SAMPLE
+  return TIER_COLOR[r.tier]
 }
 
 function formatHeight(h: string | null): string {
@@ -54,18 +63,25 @@ function formatHeight(h: string | null): string {
   return m ? `${m[1]}'${m[2]}"` : h
 }
 
-function ChartTooltip({ active, payload }: { active?: boolean; payload?: ReadonlyArray<{ payload?: Row }> }) {
+const KIND_TEXT: Record<Kind, string> = {
+  assigned: 'posición asignada',
+  eligible: 'elegible',
+  low: 'muestra baja',
+}
+
+function ChartTooltip({ active, payload, minSnaps }: { active?: boolean; payload?: ReadonlyArray<{ payload?: Row }>; minSnaps: number }) {
   const row = payload?.[0]?.payload
   if (!active || !row) return null
   return (
     <div className="rounded-md border border-slate-600 bg-board px-3 py-2 text-xs shadow-lg">
       <p className="font-bold text-white">
-        {row.position} {row.assigned && <span className="text-nfl-red">· asignada</span>}
+        {row.position} <span className={row.kind === 'assigned' ? 'text-nfl-red' : 'text-slate-400'}>· {KIND_TEXT[row.kind]}</span>
       </p>
-      <p className="text-slate-200">PressureRate: {row.rate.toFixed(1)}%</p>
+      <p className="text-slate-200">Temporada: {row.rate.toFixed(1)}% · {row.snaps} snaps</p>
       <p className="text-slate-400">
-        {row.snaps} snaps{row.tier === 'na' ? ` (muestra < ${MIN_SNAPS})` : ''}
+        En la situación: {row.sitRate === null ? 'sin snaps' : `${(row.sitRate * 100).toFixed(1)}% · ${row.sitSnaps} snaps`}
       </p>
+      {row.kind === 'low' && <p className="text-amber-400">Menos de {minSnaps} snaps: no elegible</p>}
     </div>
   )
 }
@@ -78,11 +94,11 @@ const STATS: ReadonlyArray<{ key: 'sacks' | 'hits' | 'hurries' | 'snaps'; label:
 ]
 
 /** Ficha del jugador seleccionado: métricas reales + comparativa de PressureRate por posición. */
-export default function PlayerPanel({ player, alternatives }: Props) {
-  const rows = buildRows(player, alternatives)
-  const tier = rateTier(player.pressure_rate, player.snaps)
+export default function PlayerPanel({ player, minSnaps }: Props) {
+  const rows = buildRows(player)
+  const tier = rateTier(player.pressure_rate, player.eligible)
   const tech = SLOT_LAYOUT[player.position]?.tech
-  const explanation = player.explanation?.trim() || fallbackExplanation(player, rows)
+  const crowded = rows.length > 6
 
   return (
     <section aria-live="polite" aria-label={`Ficha de ${player.displayName}`} className="flex flex-col gap-4 rounded-xl bg-board-panel p-4 sm:p-5">
@@ -90,7 +106,7 @@ export default function PlayerPanel({ player, alternatives }: Props) {
         <div className="min-w-0">
           <p className="text-xs font-semibold uppercase tracking-wider text-nfl-red">
             Asignado a {player.position}
-            {tech && tech !== '?' && tech !== 'LB' ? ` · técnica ${tech}` : ''}
+            {tech && /^\d/.test(tech) ? ` · técnica ${tech}` : ''}
           </p>
           <h2 className="truncate text-xl font-bold text-white sm:text-2xl">{player.displayName}</h2>
           <p className="text-sm text-slate-300">
@@ -113,40 +129,64 @@ export default function PlayerPanel({ player, alternatives }: Props) {
           </div>
         ))}
       </dl>
+      {player.rate_source === 'player_average' && (
+        <p className="-mt-2 text-xs text-amber-400">
+          Menos de {minSnaps} snaps en {player.position}: el optimizador usó su promedio ({pct(player.score_rate)}).
+        </p>
+      )}
 
       <div>
-        <h3 className="mb-2 text-sm font-semibold text-slate-200">PressureRate por posición alineada</h3>
-        <div className="h-56 w-full sm:h-64">
+        <h3 className="text-sm font-semibold text-slate-200">PressureRate por posición alineada</h3>
+        <p className="mb-2 text-[11px] text-slate-400">Temporada completa · {rows.length} posiciones registradas</p>
+        <div className="h-60 w-full sm:h-64">
           <ResponsiveContainer width="100%" height="100%">
-            <BarChart data={rows} margin={{ top: 20, right: 8, left: -12, bottom: 0 }}>
+            <BarChart data={rows} margin={{ top: 20, right: 8, left: -12, bottom: crowded ? 16 : 0 }}>
               <CartesianGrid stroke="#334155" strokeDasharray="3 3" vertical={false} />
-              <XAxis dataKey="position" tick={{ fill: '#CBD5E1', fontSize: 12 }} axisLine={{ stroke: '#475569' }} tickLine={false} />
+              <XAxis
+                dataKey="position"
+                interval={0}
+                tick={{ fill: '#CBD5E1', fontSize: crowded ? 10 : 12 }}
+                angle={crowded ? -35 : 0}
+                textAnchor={crowded ? 'end' : 'middle'}
+                axisLine={{ stroke: '#475569' }}
+                tickLine={false}
+              />
               <YAxis tickFormatter={(v: number) => `${v}%`} tick={{ fill: '#94A3B8', fontSize: 11 }} axisLine={false} tickLine={false} />
-              <Tooltip content={<ChartTooltip />} cursor={{ fill: '#FFFFFF', fillOpacity: 0.06 }} />
+              <Tooltip content={<ChartTooltip minSnaps={minSnaps} />} cursor={{ fill: '#FFFFFF', fillOpacity: 0.06 }} />
               <Bar dataKey="rate" radius={[4, 4, 0, 0]} isAnimationActive={false}>
                 {rows.map((r) => (
                   <Cell
                     key={r.position}
-                    fill={TIER_COLOR[r.tier]}
-                    fillOpacity={r.assigned ? 1 : 0.55}
-                    stroke={r.assigned ? '#FFFFFF' : 'none'}
-                    strokeWidth={r.assigned ? 2 : 0}
+                    fill={barFill(r)}
+                    fillOpacity={r.kind === 'assigned' ? 1 : r.kind === 'eligible' ? 0.7 : 0.45}
+                    stroke={r.kind === 'assigned' ? '#FFFFFF' : 'none'}
+                    strokeWidth={r.kind === 'assigned' ? 2.5 : 0}
                   />
                 ))}
-                <LabelList dataKey="label" position="top" fill="#E2E8F0" fontSize={11} />
+                {!crowded && <LabelList dataKey="label" position="top" fill="#E2E8F0" fontSize={11} />}
               </Bar>
             </BarChart>
           </ResponsiveContainer>
         </div>
-        <p className="mt-1 text-[11px] text-slate-400">
-          Barra con borde blanco = posición asignada. Gris = menos de {MIN_SNAPS} snaps (no elegible).
-        </p>
+        <ul className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-300">
+          <li className="inline-flex items-center gap-1.5">
+            <span className="inline-block h-3 w-3 rounded-sm border-2 border-white bg-emerald-500" /> Asignada
+          </li>
+          <li className="inline-flex items-center gap-1.5">
+            <span className="inline-block h-3 w-3 rounded-sm bg-emerald-500/70" /> Elegible (≥ {minSnaps} snaps)
+          </li>
+          <li className="inline-flex items-center gap-1.5">
+            <span className="inline-block h-3 w-3 rounded-sm" style={{ backgroundColor: LOW_SAMPLE, opacity: 0.6 }} /> Muestra baja (&lt; {minSnaps} snaps)
+          </li>
+        </ul>
       </div>
 
-      <div className="rounded-lg border-l-4 border-nfl-red bg-board p-3">
-        <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">Por qué aquí</p>
-        <p className="mt-1 text-sm text-slate-100">{explanation}</p>
-      </div>
+      {player.explanation && (
+        <div className="rounded-lg border-l-4 border-nfl-red bg-board p-3">
+          <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">Por qué aquí</p>
+          <p className="mt-1 text-sm text-slate-100">{player.explanation}</p>
+        </div>
+      )}
     </section>
   )
 }

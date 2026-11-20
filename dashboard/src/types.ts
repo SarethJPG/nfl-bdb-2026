@@ -1,60 +1,86 @@
 /**
- * Contrato esperado del backend (backend/main.py).
+ * Contrato del backend (backend/main.py).
  *
- * GET /api/teams            -> string[]  (ej. ["ARI","ATL",...])   también se acepta { teams: string[] }
+ * GET /api/teams    -> { teams: string[], situations: {value,label}[] }
  * GET /api/optimize?team=DAL&situation=3rd_long -> OptimizeResponse
  *
- * Todas las tasas (pressure_rate, *_score, gain) son fracciones 0–1:
+ * Tasas y scores son fracciones (0.172 = 17.2%). El score de un frente es la SUMA
+ * de los PressureRate de sus 4 jugadores; gain_pp = (optimal_score - habitual_score) * 100.
  * PressureRate = (1.5*Sacks + 1.0*Hits + 0.7*Hurries) / Snaps
  */
 
 export type Situation = 'all' | '3rd_down' | '3rd_long'
 
-/** Tasa de un jugador en una posición de alineación (pff_positionLinedUp). */
+/** Rendimiento del jugador en una posición (by_position). */
 export interface PositionRate {
   position: string
+  /** Temporada completa (todas las jugadas de pase). */
   pressure_rate: number
   snaps: number
+  eligible: boolean
+  is_assigned: boolean
+  /** En la situación filtrada; null si no tiene snaps ahí. */
+  situation_pressure_rate: number | null
+  situation_snaps: number
 }
 
 /** Uno de los 4 defensivos de la alineación óptima. */
 export interface LineupPlayer {
+  position: string
   nflId: number
   displayName: string
   officialPosition: string
   height: string | null
   weight: number | null
-  /** Hueco asignado por el optimizador (LE, DLT, DRT, RE…). */
-  position: string
+  /** Métricas en el hueco asignado y la situación filtrada. */
   pressure_rate: number
   sacks: number
   hits: number
   hurries: number
   snaps: number
-  /** Tasas del jugador en todas sus posiciones (incluida la asignada). */
-  position_rates?: PositionRate[]
-  /** Justificación táctica legible para el coach. */
-  explanation?: string
+  eligible: boolean
+  /** Tasa que usó el optimizador (observada o promedio del jugador si la muestra es baja). */
+  score_rate: number
+  rate_source: 'observed' | 'player_average'
+  habitual_position: string | null
+  by_position: PositionRate[]
+  explanation: string
 }
 
-/** Celda de la matriz de alternativas jugador × posición. */
-export interface AlternativeCell {
+export interface HabitualEntry {
   nflId: number
-  position: string
+  displayName: string
+  position: string | null
   pressure_rate: number
   snaps: number
+  source: string
+}
+
+export interface MatrixCell {
+  pressure_rate: number
+  snaps: number
+  eligible: boolean
+  score_rate: number
+}
+
+export interface MatrixRow {
+  nflId: number
+  displayName: string
+  rates: Record<string, MatrixCell | null>
 }
 
 export interface OptimizeResponse {
   team: string
   situation: Situation
+  slots: string[]
+  min_snaps: number
+  notices: string[]
+  completed: boolean
   lineup: LineupPlayer[]
-  /** Suma de PressureRate de la alineación óptima. */
   optimal_score: number
-  /** Suma de PressureRate de la alineación habitual (posición nominal más frecuente). */
-  baseline_score: number
-  /** optimal_score - baseline_score. */
+  habitual_score: number
   gain: number
-  /** Matriz de alternativas / explicabilidad de desplazamientos. */
-  alternatives?: AlternativeCell[]
+  gain_pp: number
+  habitual_lineup: HabitualEntry[]
+  alternatives_matrix: MatrixRow[]
 }

@@ -32,8 +32,9 @@ export const RATE_MID = 0.06
 
 export type Tier = 'high' | 'mid' | 'low' | 'na'
 
-export function rateTier(rate: number, snaps: number): Tier {
-  if (snaps < MIN_SNAPS) return 'na'
+/** Nivel semántico; `eligible` viene del backend (snaps >= min_snaps). */
+export function rateTier(rate: number, eligible: boolean): Tier {
+  if (!eligible) return 'na'
   if (rate >= RATE_HIGH) return 'high'
   if (rate >= RATE_MID) return 'mid'
   return 'low'
@@ -56,13 +57,13 @@ export const TIER_LABEL: Readonly<Record<Tier, string>> = {
 export const pct = (v: number, digits = 1) => `${(v * 100).toFixed(digits)}%`
 
 /**
- * Coordenadas en la cancha SVG (viewBox 800×440), vista desde detrás de la defensa:
+ * Coordenadas en la cancha SVG (viewBox 800×470), vista desde detrás de la defensa:
  * la izquierda de la pantalla es la izquierda de la defensa, que enfrenta al lado derecho de la ofensiva (RT, RG).
  */
-export const OL_X = { RT: 200, RG: 300, C: 400, LG: 500, LT: 600 } as const
+export const OL_X = { RT: 220, RG: 310, C: 400, LG: 490, LT: 580 } as const
 export const LOS_Y = 200
 export const DL_Y = 250
-export const LB_Y = 330
+export const LB_Y = 345
 
 export interface Slot {
   x: number
@@ -71,30 +72,37 @@ export interface Slot {
   tech: string
 }
 
+/**
+ * Cada hueco tiene su propia X; los adyacentes del borde (LOLB↔LEO↔LE, RE↔REO↔ROLB) quedan a ≥ 70 px
+ * para que los marcadores no se toquen. Las tarjetas de nombre se alternan en Y dentro de Field.tsx.
+ */
 export const SLOT_LAYOUT: Readonly<Record<string, Slot>> = {
-  LEO: { x: 95, y: DL_Y, tech: '9' },
-  LE: { x: 165, y: DL_Y, tech: '5' },
-  DLT: { x: 265, y: DL_Y, tech: '3' },
+  // OLB de pass rush: de pie en el borde, por fuera de la 9-tech
+  LOLB: { x: 45, y: DL_Y, tech: 'OLB' },
+  LEO: { x: 115, y: DL_Y, tech: '9' },
+  LE: { x: 190, y: DL_Y, tech: '5' },
+  DLT: { x: 280, y: DL_Y, tech: '3' },
+  NLT: { x: 365, y: DL_Y, tech: '1' },
   NT: { x: 400, y: DL_Y, tech: '0' },
-  NLT: { x: 370, y: DL_Y, tech: '1' },
-  NRT: { x: 430, y: DL_Y, tech: '1' },
-  DRT: { x: 535, y: DL_Y, tech: '3' },
-  RE: { x: 635, y: DL_Y, tech: '5' },
-  REO: { x: 705, y: DL_Y, tech: '9' },
-  LOLB: { x: 120, y: LB_Y, tech: 'LB' },
-  LILB: { x: 330, y: LB_Y, tech: 'LB' },
+  NRT: { x: 435, y: DL_Y, tech: '1' },
+  DRT: { x: 520, y: DL_Y, tech: '3' },
+  RE: { x: 610, y: DL_Y, tech: '5' },
+  REO: { x: 685, y: DL_Y, tech: '9' },
+  ROLB: { x: 755, y: DL_Y, tech: 'OLB' },
+  LLB: { x: 290, y: LB_Y, tech: 'LB' },
+  LILB: { x: 320, y: LB_Y, tech: 'LB' },
   MLB: { x: 400, y: LB_Y, tech: 'LB' },
-  RILB: { x: 470, y: LB_Y, tech: 'LB' },
-  ROLB: { x: 680, y: LB_Y, tech: 'LB' },
+  RILB: { x: 480, y: LB_Y, tech: 'LB' },
+  RLB: { x: 510, y: LB_Y, tech: 'LB' },
 }
 
 /** Marcas de técnica sobre la línea de golpeo (referencia visual RF-09). */
 export const TECH_MARKS: ReadonlyArray<{ x: number; label: string }> = [
-  { x: 95, label: '9' }, { x: 130, label: '7' }, { x: 165, label: '5' }, { x: 200, label: '4' },
-  { x: 265, label: '3' }, { x: 300, label: '2' }, { x: 335, label: '2i' }, { x: 370, label: '1' },
-  { x: 400, label: '0' }, { x: 430, label: '1' }, { x: 465, label: '2i' }, { x: 500, label: '2' },
-  { x: 535, label: '3' }, { x: 600, label: '4' }, { x: 635, label: '5' }, { x: 670, label: '7' },
-  { x: 705, label: '9' },
+  { x: 115, label: '9' }, { x: 155, label: '7' }, { x: 190, label: '5' }, { x: 220, label: '4' },
+  { x: 280, label: '3' }, { x: 310, label: '2' }, { x: 338, label: '2i' }, { x: 365, label: '1' },
+  { x: 400, label: '0' }, { x: 435, label: '1' }, { x: 462, label: '2i' }, { x: 490, label: '2' },
+  { x: 520, label: '3' }, { x: 580, label: '4' }, { x: 610, label: '5' }, { x: 645, label: '7' },
+  { x: 685, label: '9' },
 ]
 
 /** Nombre corto para el marcador de la cancha ("DeMarcus Lawrence" → "D. Lawrence"). */
