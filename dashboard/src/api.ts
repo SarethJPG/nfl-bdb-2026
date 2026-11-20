@@ -39,7 +39,7 @@ const num = (v: unknown, fallback = 0): number => (typeof v === 'number' && Numb
 const str = (v: unknown, fallback: string): string => (typeof v === 'string' && v.trim() ? v : fallback)
 
 export async function fetchTeams(signal?: AbortSignal): Promise<string[]> {
-  const body = await getJson('/api/teams', signal)
+  const body = await getJson('api/teams', signal)
   const raw = Array.isArray(body) ? body : (body as { teams?: unknown })?.teams
   if (!Array.isArray(raw)) throw new ApiError('Respuesta inesperada de /api/teams.', 500)
   const teams = raw.filter((t): t is string => typeof t === 'string' && TEAM_CODE_RE.test(t))
@@ -95,7 +95,7 @@ export async function fetchOptimize(
     throw new ApiError('Parámetros inválidos.', 422)
   }
   const qs = new URLSearchParams({ team, situation }).toString()
-  const body = (await getJson(`/api/optimize?${qs}`, signal)) as Partial<OptimizeResponse> | null
+  const body = (await getJson(`api/optimize?${qs}`, signal)) as Partial<OptimizeResponse> | null
   if (!body || !Array.isArray(body.lineup)) {
     throw new ApiError('Respuesta inesperada de /api/optimize.', 500)
   }
