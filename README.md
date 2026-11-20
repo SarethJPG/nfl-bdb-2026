@@ -7,3 +7,5 @@ Al evaluar el rendimiento ponderado de cada jugador según su hueco de alineaci�
 
 ## Declaración
 Este proyecto fue desarrollado íntegramente durante el evento **NFL Big Data Bowl · UNAM 2026** únicamente por los integrantes del equipo.
+
+![Dashboard kalk NFL](dashboard.png)
