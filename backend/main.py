@@ -27,8 +27,6 @@ SLOT_ORDER: tuple[str, ...] = (
 N_SLOTS = 4
 MIN_SNAPS = 5
 TOP_N = 8
-# Tasa base (baja) para un jugador sin muestra suficiente (>= MIN_SNAPS) en un hueco.
-BASE_RATE = 0.02
 SITUATIONS: tuple[str, ...] = ("all", "3rd_down", "3rd_long")
 SITUATION_LABELS = {
     "all": "Todas las jugadas",
@@ -38,7 +36,7 @@ SITUATION_LABELS = {
 TEAM_RE = re.compile(r"^[A-Z]{2,3}$")
 
 # Estado en memoria, llenado al iniciar.
-STATE: dict[str, Any] = {"agg": {}, "players": {}, "teams": [], "slots": {}}
+STATE: dict[str, Any] = {"agg": {}, "players": {}, "teams": []}
 
 
 # ----------------------------------------------------------------- datos
@@ -50,7 +48,7 @@ def pressure_rate(sacks, hits, hurries, snaps):
 def build_aggregates(
     scouting: pd.DataFrame, plays: pd.DataFrame
 ) -> dict[tuple[str, str], pd.DataFrame]:
-    """Agrega por (situación, equipo) -> filas jugador/posición con snaps >= MIN_SNAPS."""
+    """Agrega por (situación, equipo) -> filas jugador/posición con bandera eligible (snaps >= MIN_SNAPS)."""
     # El CSV trae "Pass Rush"; se compara sin distinguir mayúsculas.
     rush = scouting[scouting["pff_role"].str.casefold() == "pass rush"].copy()
     for col in ("pff_sack", "pff_hit", "pff_hurry"):
@@ -79,7 +77,7 @@ def build_aggregates(
                 snaps=("pff_sack", "size"),
             )
         )
-        g = g[g["snaps"] >= MIN_SNAPS].copy()
+        g["eligible"] = g["snaps"] >= MIN_SNAPS
         g["pressure_rate"] = pressure_rate(g["sacks"], g["hits"], g["hurries"], g["snaps"])
         for team, sub in g.groupby("defensiveTeam"):
             out[(sit, team)] = sub.drop(columns="defensiveTeam").reset_index(drop=True)
@@ -113,185 +111,237 @@ def load_data(data_dir: Path = DATA_DIR) -> None:
         for i, r in pl.iterrows()
     }
     STATE["teams"] = sorted({team for (_, team) in agg})
-    STATE["slots"] = {}
-    for team in STATE["teams"]:
-        full = agg.get(("all", team))
-        if full is None:
-            continue
-        freq = full[full["pff_positionLinedUp"].isin(SLOT_ORDER)].groupby(
-            "pff_positionLinedUp")["snaps"].sum().sort_values(ascending=False, kind="stable")
-        top = list(freq.index[:N_SLOTS])
-        if len(top) == N_SLOTS:
-            STATE["slots"][team] = tuple(sorted(top, key=SLOT_ORDER.index))
 
 
 # ----------------------------------------------------------- optimización
-def optimize_front(
-    team_df: pd.DataFrame, all_df: pd.DataFrame, SLOTS: tuple[str, ...]
-) -> dict[str, Any] | None:
-    """Asigna 4 jugadores distintos a SLOTS maximizando la suma de PressureRate.
+def select_slots(sit_df: pd.DataFrame) -> tuple[tuple[str, ...], list[str]] | None:
+    """4 huecos con candidatos elegibles (snaps >= MIN_SNAPS) en la situación.
 
-    Exacto sobre el Top 8 de pass rushers del equipo (8P4 = 1680 permutaciones).
-    Si el filtro deja menos de 4 jugadores con muestra, se completa con los
-    jugadores del frente en "all"; sin muestra en el filtro reciben BASE_RATE.
+    Si hay menos de 4, se completa solo con huecos con snaps reales (> 0).
+    Devuelve (huecos ordenados izquierda->derecha, avisos) o None.
     """
-    in_slots = team_df[team_df["pff_positionLinedUp"].isin(SLOTS)]
-    all_slots = all_df[all_df["pff_positionLinedUp"].isin(SLOTS)]
-    vol = in_slots.groupby("nflId")["snaps"].sum()
-    vol_all = all_slots.groupby("nflId")["snaps"].sum()
-    rank = pd.DataFrame({"sit": vol, "all": vol_all}).fillna(0)
-    rank = rank.sort_values(["sit", "all"], ascending=False, kind="stable")
-    if len(rank) < len(SLOTS):
+    front = sit_df[sit_df["pff_positionLinedUp"].isin(SLOT_ORDER)]
+    elig = (front[front["eligible"]].groupby("pff_positionLinedUp")["snaps"].sum()
+            .sort_values(ascending=False, kind="stable"))
+    chosen = list(elig.index[:N_SLOTS])
+    notes: list[str] = []
+    if len(chosen) < N_SLOTS:
+        rest = (front[~front["pff_positionLinedUp"].isin(chosen)]
+                .groupby("pff_positionLinedUp")["snaps"].sum()
+                .sort_values(ascending=False, kind="stable"))
+        added = list(rest.index[: N_SLOTS - len(chosen)])
+        chosen += added
+        if added:
+            notes.append(
+                f"Solo {len(elig)} hueco(s) con >= {MIN_SNAPS} snaps en este filtro; "
+                f"se completó con {', '.join(added)} (snaps reales, muestra menor)."
+            )
+    if len(chosen) < N_SLOTS:
         return None
-    ids = [int(i) for i in rank.index[:TOP_N]]
+    return tuple(sorted(chosen, key=SLOT_ORDER.index)), notes
 
-    lookup = {
-        (int(r.nflId), r.pff_positionLinedUp): r for r in in_slots.itertuples(index=False)
-    }
-    n, k = len(ids), len(SLOTS)
-    P = np.full((n, k), BASE_RATE)
-    S = np.zeros((n, k), dtype=int)
-    for i, pid in enumerate(ids):
-        for j, slot in enumerate(SLOTS):
-            r = lookup.get((pid, slot))
-            if r is not None:
-                P[i, j] = r.pressure_rate
-                S[i, j] = r.snaps
 
-    # Mejor suma; el desempate es determinista (primera permutación en orden).
-    best_perm, best_score = None, -1.0
+def _search(P: np.ndarray, V: np.ndarray, E: np.ndarray) -> tuple[list[int], float] | None:
+    """Mejor permutación (n jugadores -> k huecos) usando solo celdas con snaps > 0.
+
+    P es el puntaje de cada celda. A igualdad de puntaje se prefieren celdas elegibles (E).
+    """
+    n, k = P.shape
+    cols = np.arange(k)
+    best, best_score, best_key = None, -1.0, -1.0
     for perm in permutations(range(n), k):
-        score = float(P[list(perm), np.arange(k)].sum())
-        if score > best_score + 1e-12:
-            best_perm, best_score = perm, score
+        rows = list(perm)
+        if not V[rows, cols].all():
+            continue
+        score = float(P[rows, cols].sum())
+        key = score + 1e-6 * float(E[rows, cols].sum())
+        if key > best_key + 1e-12:
+            best, best_score, best_key = rows, score, key
+    return None if best is None else (best, best_score)
 
-    # Alineación habitual: cada hueco lo ocupa quien más snaps tiene en él (voraz, sin repetir).
-    base = [None] * k
-    used: set[int] = set()
-    pairs = sorted(
-        ((S[i, j], -i, -j) for i in range(n) for j in range(k) if S[i, j] > 0), reverse=True
-    )
-    for _, ni, nj in pairs:
-        i, j = -ni, -nj
-        if base[j] is None and i not in used:
-            base[j] = i
-            used.add(i)
-    for j in range(k):  # huecos sin dueño: el siguiente jugador libre del Top 8
-        if base[j] is None:
-            i = next(x for x in range(n) if x not in used)
-            base[j] = i
-            used.add(i)
-    base_score = float(sum(P[base[j], j] for j in range(k)))
 
-    return {"ids": ids, "P": P, "S": S, "best": list(best_perm), "best_score": best_score,
-            "base": base, "base_score": base_score}
+def _average_rate(sit_rows: pd.DataFrame, all_rows: pd.DataFrame) -> dict[str, Any]:
+    """PressureRate promedio del jugador (todas sus posiciones) en la situación; si no hay, en la temporada."""
+    for src, rows in (("situation_average", sit_rows), ("season_average", all_rows)):
+        # Con < MIN_SNAPS en la situación el promedio es ruido: se usa el de la temporada.
+        need = MIN_SNAPS if src == "situation_average" else 1
+        if not rows.empty and rows["snaps"].sum() >= need:
+            w = rows["sacks"].sum() * 1.5 + rows["hits"].sum() + rows["hurries"].sum() * 0.7
+            return {"position": None, "pressure_rate": float(w / rows["snaps"].sum()),
+                    "snaps": int(rows["snaps"].sum()), "source": src}
+    return {"position": None, "pressure_rate": 0.0, "snaps": 0, "source": "none"}
+
+
+def habitual_lineup(front_ids, sit_df, all_df, slots) -> dict[int, dict[str, Any]]:
+    """Cada jugador en su posición con más snaps elegibles, sin repetir hueco.
+
+    Los conflictos los gana quien tiene más snaps en el hueco; el perdedor pasa a su
+    siguiente hueco elegible libre. Sin hueco elegible, usa su PressureRate promedio.
+    """
+    cand = sit_df[sit_df["nflId"].isin(front_ids) & sit_df["eligible"]
+                  & sit_df["pff_positionLinedUp"].isin(slots)]
+    pairs = sorted(cand.itertuples(index=False),
+                   key=lambda r: (-r.snaps, -r.pressure_rate, int(r.nflId), r.pff_positionLinedUp))
+    out: dict[int, dict[str, Any]] = {}
+    used_slots: set[str] = set()
+    for r in pairs:
+        pid = int(r.nflId)
+        if pid in out or r.pff_positionLinedUp in used_slots:
+            continue
+        top = cand[cand["nflId"] == pid]["snaps"].max()
+        out[pid] = {"position": r.pff_positionLinedUp, "pressure_rate": float(r.pressure_rate),
+                    "snaps": int(r.snaps), "source": "modal" if r.snaps == top else "next_best"}
+        used_slots.add(r.pff_positionLinedUp)
+    for pid in front_ids:
+        if pid not in out:
+            out[pid] = _average_rate(sit_df[sit_df["nflId"] == pid], all_df[all_df["nflId"] == pid])
+    return out
 
 
 def _pct(x: float) -> str:
     return f"{x * 100:.1f}%"
 
 
-def build_response(team: str, situation: str, team_df: pd.DataFrame) -> dict[str, Any] | None:
-    SLOTS = STATE["slots"].get(team)
+def build_response(team: str, situation: str) -> dict[str, Any] | None:
+    sit_df = STATE["agg"].get((situation, team))
     all_df = STATE["agg"].get(("all", team))
-    if SLOTS is None or all_df is None:
+    if sit_df is None or all_df is None:
         return None
-    res = optimize_front(team_df, all_df, SLOTS)
-    if res is None:
+    sel = select_slots(sit_df)
+    if sel is None:
         return None
-    ids, P, S = res["ids"], res["P"], res["S"]
-    best, base = res["best"], res["base"]
-    names = {pid: (STATE["players"].get(pid, {}).get("displayName") or str(pid)) for pid in ids}
-    label = SITUATION_LABELS[situation]
-    stats = {
-        (int(r.nflId), r.pff_positionLinedUp): r for r in team_df.itertuples(index=False)
-    }
+    slots, notes = sel
+    k = len(slots)
 
-    lineup = []
-    for j, slot in enumerate(SLOTS):
-        i = best[j]
-        pid = ids[i]
-        r = stats.get((pid, slot))
-        estimated = r is None
-        by_pos = [
-            {
-                "position": pos,
-                "pressure_rate": round(float(rr.pressure_rate), 4),
-                "snaps": int(rr.snaps),
-            }
-            for (p2, pos), rr in stats.items()
-            if p2 == pid
-        ]
-        by_pos.sort(key=lambda d: -d["pressure_rate"])
-        own_base = next((jj for jj in range(len(SLOTS)) if base[jj] == i), None)
-        displaced_i = base[j]
+    in_slots = sit_df[sit_df["pff_positionLinedUp"].isin(slots)]
+    rank = pd.DataFrame({
+        "elig": in_slots[in_slots["eligible"]].groupby("nflId")["snaps"].sum(),
+        "tot": in_slots.groupby("nflId")["snaps"].sum(),
+    }).fillna(0).sort_values(["elig", "tot"], ascending=False, kind="stable")
+    all_ids = [int(i) for i in rank.index[:12]]
+    stats = {(int(r.nflId), r.pff_positionLinedUp): r for r in sit_df.itertuples(index=False)}
 
-        parts = []
-        if estimated:
-            parts.append(
-                f"Sin muestra suficiente (<{MIN_SNAPS} snaps) en {slot}; se usa tasa base {_pct(BASE_RATE)}."
-            )
-        else:
-            parts.append(
-                f"{names[pid]} genera {_pct(float(r.pressure_rate))} de presión en {slot} "
-                f"({int(r.snaps)} snaps) en {label}."
-            )
-        if own_base is not None and own_base != j and S[i, own_base] > 0:
-            parts.append(
-                f"Su hueco habitual es {SLOTS[own_base]} ({_pct(P[i, own_base])}, "
-                f"{int(S[i, own_base])} snaps)."
-            )
-        if displaced_i != i and S[displaced_i, j] > 0:
-            parts.append(
-                f"{names[ids[displaced_i]]}, habitual en {slot}, rinde {_pct(P[displaced_i, j])} "
-                f"({int(S[displaced_i, j])} snaps) ahí."
-            )
-        lineup.append(
-            {
-                "position": slot,
-                "nflId": pid,
-                **STATE["players"].get(pid, {}),
-                "pressure_rate": round(float(P[i, j]), 4),
-                "sacks": 0 if estimated else int(r.sacks),
-                "hits": 0 if estimated else int(r.hits),
-                "hurries": 0 if estimated else int(r.hurries),
-                "snaps": int(S[i, j]),
-                "estimated": estimated,
-                "by_position": by_pos,
-                "habitual_position": SLOTS[own_base] if own_base is not None else None,
-                "explanation": " ".join(parts),
-            }
+    # Celdas con snaps > 0. Elegible (>= MIN_SNAPS): puntaje = su tasa observada.
+    # No elegible: puntaje = tasa promedio del jugador en la situación (no se confía en la muestra).
+    avg = {pid: _average_rate(sit_df[sit_df["nflId"] == pid],
+                              all_df[all_df["nflId"] == pid])["pressure_rate"] for pid in all_ids}
+    found = None
+    for limit in (TOP_N, 12):
+        ids = all_ids[:limit]
+        if len(ids) < k:
+            continue
+        P = np.zeros((len(ids), k))
+        S = np.zeros((len(ids), k), dtype=int)
+        V = np.zeros((len(ids), k), dtype=bool)
+        E = np.zeros((len(ids), k), dtype=bool)
+        for i, pid in enumerate(ids):
+            for j, slot in enumerate(slots):
+                r = stats.get((pid, slot))
+                if r is not None:
+                    V[i, j], E[i, j], S[i, j] = True, bool(r.eligible), r.snaps
+                    P[i, j] = r.pressure_rate if r.eligible else avg[pid]
+        hit = _search(P, V, E)
+        if hit:
+            found = (ids, P, S, E, hit)
+            break
+    if found is None:
+        return None
+    ids, P, S, E, (best, best_score) = found
+    if any(not E[best[j], j] for j in range(k)):
+        notes.append(
+            f"No hay 4 jugadores distintos con >= {MIN_SNAPS} snaps en estos huecos; se completó con "
+            "jugadores con snaps reales pero muestra menor (no elegibles). Su aporte al puntaje es su "
+            "tasa promedio en la situación."
         )
 
-    habitual = [
-        {"position": slot, "nflId": ids[base[j]], "displayName": names[ids[base[j]]],
-         "pressure_rate": round(float(P[base[j], j]), 4), "snaps": int(S[base[j], j])}
-        for j, slot in enumerate(SLOTS)
-    ]
-    gain = res["best_score"] - res["base_score"]
+    names = {pid: (STATE["players"].get(pid, {}).get("displayName") or str(pid)) for pid in ids}
+    label = SITUATION_LABELS[situation]
+    front_ids = [ids[best[j]] for j in range(k)]
+
+    # Baseline: cada jugador del frente en su posición habitual.
+    habitual, base_score = [], 0.0
+    hab = habitual_lineup(front_ids, sit_df, all_df, slots)
+    for pid in front_ids:
+        h = hab[pid]
+        base_score += h["pressure_rate"]
+        habitual.append({"nflId": pid, "displayName": names[pid], "position": h["position"],
+                         "pressure_rate": round(h["pressure_rate"], 4), "snaps": h["snaps"],
+                         "source": h["source"]})
+    hab_by_id = {h["nflId"]: h for h in habitual}
+
+    lineup = []
+    for j, slot in enumerate(slots):
+        pid = front_ids[j]
+        r = stats[(pid, slot)]
+        eligible = bool(r.eligible)
+        pl_all = all_df[all_df["nflId"] == pid].sort_values(
+            ["snaps", "pressure_rate"], ascending=False, kind="stable")
+        by_pos = []
+        for rr in pl_all.itertuples(index=False):
+            sr = stats.get((pid, rr.pff_positionLinedUp))
+            by_pos.append({
+                "position": rr.pff_positionLinedUp,
+                "pressure_rate": round(float(rr.pressure_rate), 4),
+                "snaps": int(rr.snaps),
+                "eligible": bool(rr.eligible),
+                "is_assigned": rr.pff_positionLinedUp == slot,
+                "situation_pressure_rate": None if sr is None else round(float(sr.pressure_rate), 4),
+                "situation_snaps": 0 if sr is None else int(sr.snaps),
+            })
+        h = hab_by_id[pid]
+        text = (f"{names[pid]} genera {_pct(float(r.pressure_rate))} de presión en {slot} "
+                f"({int(r.snaps)} snaps) en {label}.")
+        if not eligible:
+            text += (f" Muestra menor a {MIN_SNAPS} snaps: en el puntaje cuenta su tasa promedio "
+                     f"({_pct(float(P[best[j], j]))}).")
+        if h["position"] and h["position"] != slot:
+            text += f" Su hueco habitual es {h['position']} ({_pct(h['pressure_rate'])}, {h['snaps']} snaps)."
+        elif h["source"] != "modal":
+            text += (f" Sin snaps elegibles en un hueco del frente; su tasa promedio es "
+                     f"{_pct(h['pressure_rate'])} ({h['snaps']} snaps).")
+        lineup.append({
+            "position": slot,
+            "nflId": pid,
+            **STATE["players"].get(pid, {}),
+            "pressure_rate": round(float(r.pressure_rate), 4),
+            "sacks": int(r.sacks), "hits": int(r.hits), "hurries": int(r.hurries),
+            "snaps": int(r.snaps),
+            "eligible": eligible,
+            "score_rate": round(float(P[best[j], j]), 4),
+            "rate_source": "observed" if eligible else "player_average",
+            "habitual_position": h["position"],
+            "by_position": by_pos,
+            "explanation": text,
+        })
+
+    gain = best_score - base_score
+    if gain < -1e-9:
+        notes.append(
+            "La alineación habitual incluye jugadores sin hueco con snaps reales, valorados con su "
+            "tasa promedio; esa estimación supera a la mejor asignación con snaps observados, por lo "
+            "que la ganancia es negativa."
+        )
     matrix = [
         {
-            "nflId": pid,
-            "displayName": names[pid],
+            "nflId": pid, "displayName": names[pid],
             "rates": {
-                slot: {"pressure_rate": round(float(P[i, j]), 4), "snaps": int(S[i, j]),
-                       "estimated": bool(S[i, j] == 0)}
-                for j, slot in enumerate(SLOTS)
+                slot: (None if (pid, slot) not in stats else {
+                    "pressure_rate": round(float(stats[(pid, slot)].pressure_rate), 4),
+                    "snaps": int(stats[(pid, slot)].snaps),
+                    "eligible": bool(stats[(pid, slot)].eligible),
+                    "score_rate": round(float(P[i, j]), 4)})
+                for j, slot in enumerate(slots)
             },
         }
         for i, pid in enumerate(ids)
     ]
     return {
-        "team": team,
-        "situation": situation,
-        "slots": list(SLOTS),
-        "min_snaps": MIN_SNAPS,
-        "base_rate": BASE_RATE,
+        "team": team, "situation": situation, "slots": list(slots), "min_snaps": MIN_SNAPS,
+        "notices": notes, "completed": any(n.startswith(("Solo", "No hay 4")) for n in notes),
         "lineup": lineup,
-        "optimal_score": round(res["best_score"], 4),
-        "habitual_score": round(res["base_score"], 4),
-        "gain": round(gain, 4),
-        "gain_pp": round(gain * 100, 2),
+        "optimal_score": round(best_score, 4),
+        "habitual_score": round(base_score, 4),
+        "gain": round(gain, 4), "gain_pp": round(gain * 100, 2),
         "habitual_lineup": habitual,
         "alternatives_matrix": matrix,
     }
@@ -339,10 +389,7 @@ def teams() -> dict:
 
 @app.get("/api/optimize")
 def optimize(q: Annotated[OptimizeQuery, Query()]) -> dict:
-    team_df = STATE["agg"].get((q.situation, q.team))
-    if team_df is None:  # sin ninguna fila elegible en el filtro
-        team_df = STATE["agg"][("all", q.team)].iloc[0:0]
-    result = build_response(q.team, q.situation, team_df)
+    result = build_response(q.team, q.situation)
     if result is None:
         raise HTTPException(
             status_code=404,
